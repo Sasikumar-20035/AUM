@@ -39,10 +39,7 @@ def update_pms_sheet(data: dict):
     }
     """
 
-    gc = gspread.oauth(
-        credentials_filename=CREDENTIALS_FILE,
-        authorized_user_filename=TOKEN_FILE,
-    )
+    gc = gspread.service_account(filename=CREDENTIALS_FILE)
     sh = gc.open_by_key(SHEET_ID)
     sheet = sh.worksheet(WORKSHEET_NAME)
 
