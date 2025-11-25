@@ -33,7 +33,7 @@ jobs:
         run: |
           echo "Running test for: 10-2025"
 
-          python data.py "Capitalmind Financial Services Private Limited" "10-2025"
+          python Data1.py "Capitalmind Financial Services Private Limited" "10-2025"
           
 
           echo "Test completed."
