@@ -1,0 +1,39 @@
+name: PMS Scraper Test (One-Time)
+
+on:
+  workflow_dispatch:   # run manually
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create credentials.json
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+        run: echo "$GCP_CREDENTIALS_JSON" > credentials.json
+
+      - name: Run scraper for OCT 2025 (3 PMS)
+        run: |
+          echo "Running test for: 10-2025"
+
+          python data.py "Capitalmind Financial Services Private Limited" "10-2025"
+          
+
+          echo "Test completed."
