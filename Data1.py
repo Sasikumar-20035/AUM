@@ -15,8 +15,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 # =========================
 # GOOGLE SHEETS CONFIG
 # =========================
-CREDENTIALS_FILE = "/Users/arav.krishnan/Downloads/client_secret_226188314234-i0pmqcpbtl3pnr30rk3bpmh3aft0f4jm.apps.googleusercontent.com.json"
-TOKEN_FILE = "token.json"
+CREDENTIALS_FILE = "credentials.json"
+
 SHEET_ID = "16soY3eRQdOqqZxEmlchJUuEcOlNO3pibSId7B_d13Hc"
 WORKSHEET_NAME = "Capitalmind"
 
