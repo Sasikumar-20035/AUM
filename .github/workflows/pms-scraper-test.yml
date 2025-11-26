@@ -83,14 +83,14 @@ jobs:
           # Quarter PMS (01,04,07,10): Capitalmind + Wealth Managers
           if [ "${{ steps.gate.outputs.run_quarter }}" = "yes" ]; then
             echo "-> Running quarter PMS: Capitalmind + Wealth Managers"
-            python Data1.py "Capitalmind Financial Services Private Limited" "$MONTHYEAR"
-            python Data1.py "Wealth Managers (India) Pvt. Ltd." "$MONTHYEAR"
+            python Data.py "Capitalmind Financial Services Private Limited" "$MONTHYEAR"
+            python Data.py "Wealth Managers (India) Pvt. Ltd." "$MONTHYEAR"
           fi
 
           # Dezerv on its own month set (02,05,08,11)
           if [ "${{ steps.gate.outputs.run_dezerv }}" = "yes" ]; then
             echo "-> Running Dezerv PMS"
-            python Data1.py "Dezerv Investments Private Limited" "$MONTHYEAR"
+            python Data.py "Dezerv Investments Private Limited" "$MONTHYEAR"
           fi
 
           echo "All configured PMS runs completed for $MONTHYEAR."
