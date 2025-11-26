@@ -1,6 +1,8 @@
 import sys
 import time
 import calendar
+import re
+from typing import Optional
 
 import gspread
 
@@ -15,10 +17,50 @@ from webdriver_manager.chrome import ChromeDriverManager
 # =========================
 # GOOGLE SHEETS CONFIG
 # =========================
+# IMPORTANT:
+# - Locally: this file will be your OAuth client JSON from Google (renamed to credentials.json)
+# - In GitHub: this file will be recreated from a secret
 CREDENTIALS_FILE = "credentials.json"
+TOKEN_FILE = "token.json"
+SHEET_ID = "1PgkGujYQitevjhdUP3TIK1D5sDvf6WMnsYCpvXZCSPw"
+WORKSHEET_NAME = "Sheet3"
 
-SHEET_ID = "16soY3eRQdOqqZxEmlchJUuEcOlNO3pibSId7B_d13Hc"
-WORKSHEET_NAME = "Capitalmind"
+
+# =========================
+# IA NAME CLEANING
+# =========================
+def clean_ia_name(ia_name: str, pms_name: Optional[str]) -> str:
+    """
+    Remove occurrences of PMS name (full or partial significant tokens)
+    from the IA name. Case-insensitive, also removes large tokens
+    (e.g. 'Dezerv', 'Capitalmind', 'Wealth', 'Investments', etc.).
+    """
+    if not pms_name:
+        return ia_name.strip()
+
+    original = ia_name
+    ia = ia_name
+
+    # 1) Remove full PMS name if it appears as a substring (case-insensitive)
+    pattern_full = re.compile(re.escape(pms_name), flags=re.IGNORECASE)
+    ia = pattern_full.sub("", ia)
+
+    # 2) Remove "big" tokens from the PMS name (length >= 4)
+    tokens = [tok for tok in re.split(r"[\s\.]+", pms_name) if len(tok) >= 4]
+    for tok in tokens:
+        pattern_tok = re.compile(re.escape(tok), flags=re.IGNORECASE)
+        ia = pattern_tok.sub("", ia)
+
+    # Clean up leftover spaces / dashes
+    ia = re.sub(r"[-–—]+", " ", ia)      # replace dashes with space
+    ia = " ".join(ia.split())           # normalize whitespace
+    ia = ia.strip(" -–—")               # trim leftover punctuation
+
+    if not ia:
+        # fallback to original if we stripped everything somehow
+        return original.strip()
+
+    return ia
 
 
 # =========================
@@ -39,7 +81,10 @@ def update_pms_sheet(data: dict):
     }
     """
 
-    gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    gc = gspread.oauth(
+        credentials_filename=CREDENTIALS_FILE,
+        authorized_user_filename=TOKEN_FILE,
+    )
     sh = gc.open_by_key(SHEET_ID)
     sheet = sh.worksheet(WORKSHEET_NAME)
 
@@ -94,17 +139,24 @@ def update_pms_sheet(data: dict):
 
     # ---- helpers ----
     def is_strategy_marker(text: str) -> bool:
-        t = text.strip().lower()
+        """
+        TRUE only for real strategy header rows, NOT for things like
+        'Equity Strategy - Non Discretionary'.
+        """
+        t = " ".join(text.lower().split())
         return (
-            t.startswith("equity")
-            or t.startswith("debt")
-            or t.startswith("hybrid")
+            t.startswith("equity aum total")  # equity header
+            or t == "debt"
+            or t.startswith("debt ")
+            or t == "hybrid"
+            or t.startswith("hybrid ")
             or t.startswith("multi-asset")
             or t.startswith("multi asset")
         )
 
     def is_service_marker(text: str) -> bool:
-        t = text.strip().lower()
+        # AUM Total header rows ONLY
+        t = " ".join(text.lower().split())
         return ("aum total" in t) and ("discretionary" in t)
 
     # strategy name as used in sheet
@@ -115,71 +167,109 @@ def update_pms_sheet(data: dict):
     service_raw = data["service_type"].strip().lower()
     is_non_disc = service_raw.startswith("non")
 
-    # ---- write each IA ----
+    # ==== FIND STRATEGY ROW ONCE ====
+    print(f"\n[DEBUG] Looking for STRATEGY row for '{strategy_name}'")
+    strat_idx = -1
+    for i, row in enumerate(all_rows):
+        if len(row) > 1:
+            raw_b = row[1]
+            cell = " ".join(raw_b.lower().split())
+            print(f"   [DEBUG][STRAT] row {i+1}: {repr(raw_b)}  ->  {cell}")
+            if cell.startswith(strategy_name):
+                strat_idx = i
+                print(f"   [DEBUG][STRAT] >>> MATCH strategy '{strategy_name}' at row {i+1}")
+                break
+
+    if strat_idx == -1:
+        print(f"[SHEET] Strategy '{strategy_name}' not found in column B. Skipping whole block.")
+        return
+
+    # ==== FIND SERVICE HEADER ROW (Dis / Non-Dis) ====
+    print(
+        f"[DEBUG] Looking for SERVICE header for '{data['service_type']}' "
+        f"under strategy row {strat_idx+1}"
+    )
+    serv_idx = -1
+    for i in range(strat_idx + 1, len(all_rows)):
+        row = all_rows[i]
+        if len(row) <= 1:
+            continue
+
+        raw_b = row[1]
+        cell = " ".join(raw_b.lower().split())
+        print(f"   [DEBUG][SERV] row {i+1}: {repr(raw_b)}  ->  {cell}")
+
+        # stop when we hit next strategy section
+        if is_strategy_marker(cell):
+            print("   [DEBUG][SERV] --- hit next strategy marker; stop searching service header here ---")
+            break
+
+        if is_service_marker(cell):
+            # Now discriminate between Discretionary and Non-Discretionary
+            if is_non_disc:
+                if "non" in cell:
+                    serv_idx = i
+                    print(f"   [DEBUG][SERV] >>> MATCH Non-Discretionary header at row {i+1}")
+                    break
+                else:
+                    print("   [DEBUG][SERV] contains 'discretionary' but NOT 'non' (need non-discretionary) – skip")
+            else:
+                if "non" not in cell:
+                    serv_idx = i
+                    print(f"   [DEBUG][SERV] >>> MATCH Discretionary header at row {i+1}")
+                    break
+                else:
+                    print("   [DEBUG][SERV] has 'non' (this is non-discretionary) – skip for pure discretionary")
+
+    if serv_idx == -1:
+        print(
+            f"[SHEET] Service type row for '{data['service_type']}' "
+            f"not found under strategy '{strategy_name}'. Skipping."
+        )
+        return
+
+    # ==== FIND BLOCK END (next service header or next strategy header) ====
+    next_block = len(all_rows)
+    for i in range(serv_idx + 1, len(all_rows)):
+        row = all_rows[i]
+        if len(row) <= 1:
+            continue
+        cell = " ".join(row[1].lower().split())
+
+        if is_strategy_marker(cell) or is_service_marker(cell):
+            next_block = i
+            break
+
+    print(f"[DEBUG] IA rows for this block will be searched between rows {serv_idx+2} and {next_block} (1-based)")
+
+    # ==== WRITE EACH IA INSIDE THIS BLOCK ====
     for res in data["results"]:
-        ia_name = res["ia_name"].strip()
+        # Clean IA name from scraping:
+        raw_ia_name = res["ia_name"].strip()
+        # Remove any leading dot like ". Alpha Focus Strategy"
+        raw_ia_name = raw_ia_name.lstrip(". ").strip()
+        ia_name = clean_ia_name(raw_ia_name, data.get("pms_name"))
         aum_value = res["aum"]  # already without ₹
 
+        print(f"\n[DEBUG][IA] Processing IA '{ia_name}' (raw: {res['ia_name']})")
+
+        # Refresh rows (in case we added rows earlier in this run)
         all_rows = sheet.get_all_values()
 
-        strat_idx = -1
-        serv_idx = -1
-        next_block = len(all_rows)
-
-        # 1) find strategy row (Equity AUM Total / Debt / Hybrid / Multi-Asset)
-        for i, row in enumerate(all_rows):
-            if len(row) > 1:
-                cell = row[1].strip().lower()
-                if cell.startswith(strategy_name):
-                    strat_idx = i
-                    break
-
-        if strat_idx == -1:
-            raise Exception(f"Strategy '{strategy_name}' not found in column B.")
-
-        # 2) find service row (• Discretionary / • Non-Discretionary AUM Total)
-        for i in range(strat_idx + 1, len(all_rows)):
-            row = all_rows[i]
-            if len(row) <= 1:
-                continue
-            cell = row[1].strip().lower()
-
-            if is_strategy_marker(cell):
-                break
-
-            if "aum total" in cell and "discretionary" in cell:
-                if is_non_disc:
-                    if "non" in cell:
-                        serv_idx = i
-                        break
-                else:
-                    if "non" not in cell:
-                        serv_idx = i
-                        break
-
-        if serv_idx == -1:
-            raise Exception(
-                f"Service type row for '{data['service_type']}' not found after strategy '{strategy_name}'."
-            )
-
-        # 3) block end (next service or next strategy)
-        for i in range(serv_idx + 1, len(all_rows)):
-            row = all_rows[i]
-            if len(row) <= 1:
-                continue
-            cell = row[1].strip().lower()
-            if is_service_marker(cell) or is_strategy_marker(cell):
-                next_block = i
-                break
-
-        # 4) look for IA row
+        # 4) look for IA row inside [serv_idx+1, next_block)
         ia_idx = -1
         for i in range(serv_idx + 1, next_block):
             row = all_rows[i]
             if len(row) > IA_COL_IDX:
                 cell_ia = row[IA_COL_IDX].strip()
-                if cell_ia.lower() == ia_name.lower():
+                cell_ia_norm = cell_ia.lstrip(". ").strip().lower()
+                print(
+                    f"   [DEBUG][IA-MATCH] row {i+1}: sheet IA '{cell_ia}' "
+                    f"-> norm '{cell_ia_norm}' vs target '{ia_name.lower()}'"
+                )
+                if cell_ia_norm == ia_name.lower():
                     ia_idx = i
+                    print(f"   [DEBUG][IA-MATCH] >>> MATCH at row {i+1}")
                     break
 
         if ia_idx != -1:
@@ -194,6 +284,8 @@ def update_pms_sheet(data: dict):
             insert_at = next_block + 1
             sheet.insert_row(newrow, insert_at)
             print(f"[SHEET] Inserted IA '{ia_name}' at row {insert_at}, col {month_col_index} = {aum_value}")
+            # block end shifts down by 1
+            next_block += 1
 
 
 # =========================
@@ -232,25 +324,30 @@ def recompute_totals_for_month(month_value: str, year_value: str):
 
     rscr_row = all_rows[rscr_row_idx]
     if target_month not in rscr_row:
-        print(f"[TOTALS] Month '{target_month}' not found.")
+        print(f("[TOTALS] Month '{target_month}' not found."))
         return
 
     month_col_index = rscr_row.index(target_month) + 1  # 1-based
     print(f"[TOTALS] Recomputing totals for {target_month} (col {month_col_index})")
 
     def is_strategy_marker(text: str) -> bool:
-        t = text.strip().lower()
+        """
+        Same logic as above: match only real strategy headers.
+        """
+        t = " ".join(text.lower().split())
         return (
-            t.startswith("equity")
-            or t.startswith("debt")
-            or t.startswith("hybrid")
+            t.startswith("equity aum total")
+            or t == "debt"
+            or t.startswith("debt ")
+            or t == "hybrid"
+            or t.startswith("hybrid ")
             or t.startswith("multi-asset")
             or t.startswith("multi asset")
         )
 
     def is_service_marker(text: str) -> bool:
-        t = text.strip().lower()
-        # e.g. "• Discretionary AUM Total", "• Non-Discretionary AUM Total"
+        t = " ".join(text.lower().split())
+        # only header rows: "Discretionary AUM Total", "Non-Discretionary AUM Total"
         return ("aum total" in t) and ("discretionary" in t)
 
     strategy_totals = {}
@@ -261,17 +358,17 @@ def recompute_totals_for_month(month_value: str, year_value: str):
         if len(row) <= 1:
             continue
 
-        col_b = row[1].strip()
-        col_b_lower = col_b.lower()
+        col_b = row[1]
+        col_b_norm = " ".join(col_b.lower().split())
 
         # strategy header row
-        if is_strategy_marker(col_b_lower):
+        if is_strategy_marker(col_b_norm):
             current_strategy_row = i
             strategy_totals.setdefault(i, 0.0)
             continue
 
         # service total row
-        if is_service_marker(col_b_lower):
+        if is_service_marker(col_b_norm):
             if current_strategy_row is None:
                 continue
 
@@ -282,7 +379,7 @@ def recompute_totals_for_month(month_value: str, year_value: str):
             for j in range(service_row_idx + 1, len(all_rows)):
                 if len(all_rows[j]) <= 1:
                     continue
-                b2 = all_rows[j][1].strip().lower()
+                b2 = " ".join(all_rows[j][1].lower().split())
                 if is_service_marker(b2) or is_strategy_marker(b2):
                     block_end = j
                     break
@@ -298,6 +395,7 @@ def recompute_totals_for_month(month_value: str, year_value: str):
                 try:
                     subtotal += float(val_str)
                 except ValueError:
+                    # e.g. "NA"
                     continue
 
             sheet.update_cell(service_row_idx + 1, month_col_index, f"{subtotal:.2f}")
@@ -394,9 +492,14 @@ def scrape_one_combo(driver, strategy_value, service_code, month_value, year_val
             tds = row.find_elements(By.TAG_NAME, "td")
             if len(tds) < 3:
                 continue
-            ia_name = tds[1].text.strip()
+            ia_name_raw = tds[1].text.strip()
             aum_raw = tds[2].text.strip()
             aum = aum_raw.replace("₹", "").strip()
+
+            # strip leading dot then clean by PMS name
+            ia_name_raw = ia_name_raw.lstrip(". ").strip()
+            ia_name = clean_ia_name(ia_name_raw, pms_name)
+
             ia_results.append({"ia_name": ia_name, "aum": aum})
         print(f"[SCRAPE] Page {page_num}: total records so far = {len(ia_results)}")
 
@@ -446,7 +549,7 @@ def print_usage():
         "Usage:\n"
         "  python3 data.py <PMS_NAME_OR_-> <MM-YYYY> [<MM-YYYY> ...]\n\n"
         "Examples:\n"
-        "  python3 data.py \"Capitalmind Financial Services Private Limited\" 06-2024 07-2024\n"
+        '  python3 data.py "Capitalmind Financial Services Private Limited" 06-2024 07-2024\n'
         "  python3 data.py - 06-2024 07-2024 08-2025   # '-' = ALL PMS\n"
     )
 
@@ -529,7 +632,3 @@ if __name__ == "__main__":
     finally:
         driver.quit()
         time.sleep(1)
-
-
-
-
