@@ -20,61 +20,135 @@ from webdriver_manager.chrome import ChromeDriverManager
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.json"
 SHEET_ID = "16soY3eRQdOqqZxEmlchJUuEcOlNO3pibSId7B_d13Hc"
+WORKSHEET_NAME = "Sheet3"   # default / fallback
 
 
 # =========================
-# SHEET NAME FROM PMS NAME
+# HELPER: PMS -> WORKSHEET
 # =========================
-def sheet_name_from_pms(pms_name: Optional[str]) -> str:
+def resolve_worksheet_name(pms_name: Optional[str]) -> str:
     """
-    Map PMS provider name to worksheet/tab name.
+    Map PMS provider name to worksheet title.
 
-    Rules:
-      - "Capitalmind Financial Services Private Limited" -> "Capitalmind"
-      - "Dezerv Investments Private Limited"             -> "Dezerv"
-      - "Wealth Managers (India) Pvt. Ltd."             -> "Scripbox"
-      - If PMS is None / "-" / "all"                    -> fallback "Sheet3"
-      - Otherwise                                       -> fallback to pms_name as sheet name
+    - Capitalmind Financial Services Private Limited -> Capitalmind
+    - Dezerv Investments Private Limited            -> Dezerv
+    - Wealth Managers (India) Pvt. Ltd.             -> Scripbox
+    - None / '-' / ALL / others                     -> WORKSHEET_NAME (fallback)
     """
     if not pms_name:
-        return "Sheet3"  # fallback for ALL PMS mode
+        return WORKSHEET_NAME
 
-    name_norm = pms_name.strip().lower()
+    p = pms_name.lower()
 
-    if name_norm == "capitalmind financial services private limited":
+    if "capitalmind" in p:
         return "Capitalmind(Automatic)"
-    if name_norm == "dezerv investments private limited":
+    if "dezerv" in p:
         return "Dezerv(Automatic)"
-    if name_norm == "wealth managers (india) pvt. ltd.":
+    if "wealth managers" in p:
         return "Scripbox(Automatic)"
 
-    # Fallback: try use PMS name directly as sheet name
-    return pms_name
+    # fallback to default
+    return WORKSHEET_NAME
+
+
+def get_or_create_worksheet(sh, title: str):
+    """Return worksheet by title; create if it doesn't exist."""
+    try:
+        ws = sh.worksheet(title)
+        print(f"[SHEET] Using existing worksheet '{title}'")
+        return ws
+    except gspread.WorksheetNotFound:
+        print(f"[SHEET] Worksheet '{title}' not found. Creating it...")
+        ws = sh.add_worksheet(title=title, rows=2000, cols=50)
+        return ws
+
+
+# =========================
+# HELPER: COLUMN LETTER
+# =========================
+def col_to_letter(col: int) -> str:
+    """Convert 1-based column index to A1 column letter."""
+    s = ""
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+# =========================
+# HELPER: APPLY IA ROW FORMAT
+# =========================
+def apply_ia_row_format(sheet, row_idx: int, month_col_index: int):
+    """
+    Apply style only for IA detail row:
+      - Font: Arial
+      - Size: 9
+      - Italic: True
+      - Color: dark grey (0.2,0.2,0.2)
+    Only on:
+      - Column B (IA name)
+      - Current month AUM cell for that row
+    """
+    try:
+        from gspread_formatting import format_cell_range, CellFormat, TextFormat, Color
+    except ImportError:
+        print("[FORMAT] gspread-formatting not installed; skipping IA formatting.")
+        return
+
+    # Define the text style
+    fmt = CellFormat(
+        textFormat=TextFormat(
+            fontFamily="Arial",
+            fontSize=9,
+            italic=True,
+            foregroundColor=Color(red=0.2, green=0.2, blue=0.2),
+        )
+    )
+
+    # IA name cell: column B
+    ia_cell_range = f"B{row_idx}:B{row_idx}"
+    format_cell_range(sheet, ia_cell_range, fmt)
+
+    # AUM cell: current month column
+    col_letter = col_to_letter(month_col_index)
+    aum_cell_range = f"{col_letter}{row_idx}:{col_letter}{row_idx}"
+    format_cell_range(sheet, aum_cell_range, fmt)
+
+    print(f"[FORMAT] Applied IA formatting to row {row_idx}, cols B and {col_letter}")
 
 
 # =========================
 # IA NAME CLEANING
 # =========================
 def clean_ia_name(ia_name: str, pms_name: Optional[str]) -> str:
+    """
+    Remove occurrences of PMS name (full or partial significant tokens)
+    from the IA name. Case-insensitive, also removes large tokens
+    (e.g. 'Dezerv', 'Capitalmind', 'Wealth', 'Investments', etc.).
+    """
     if not pms_name:
         return ia_name.strip()
 
     original = ia_name
     ia = ia_name
 
+    # 1) Remove full PMS name if it appears as a substring (case-insensitive)
     pattern_full = re.compile(re.escape(pms_name), flags=re.IGNORECASE)
     ia = pattern_full.sub("", ia)
 
+    # 2) Remove "big" tokens from the PMS name (length >= 4)
     tokens = [tok for tok in re.split(r"[\s\.]+", pms_name) if len(tok) >= 4]
     for tok in tokens:
         pattern_tok = re.compile(re.escape(tok), flags=re.IGNORECASE)
         ia = pattern_tok.sub("", ia)
 
-    ia = re.sub(r"[-–—]+", " ", ia)
-    ia = " ".join(ia.split())
-    ia = ia.strip(" -–—")
+    # Clean up leftover spaces / dashes
+    ia = re.sub(r"[-–—]+", " ", ia)      # replace dashes with space
+    ia = " ".join(ia.split())           # normalize whitespace
+    ia = ia.strip(" -–—")               # trim leftover punctuation
 
     if not ia:
+        # fallback to original if we stripped everything somehow
         return original.strip()
 
     return ia
@@ -83,27 +157,46 @@ def clean_ia_name(ia_name: str, pms_name: Optional[str]) -> str:
 # =========================
 # GOOGLE SHEET UPDATE LOGIC
 # =========================
-def update_pms_sheet(data: dict, worksheet_name: str):
+def update_pms_sheet(data: dict):
+    """
+    data = {
+        "strategy": "equity" | "debt" | "hybrid" | "multi",
+        "service_type": "discretionary" | "non discretionary",
+        "month": "01".."12",
+        "year": "2025",
+        "pms_name": "...",  # optional
+        "results": [
+            {"ia_name": "...", "aum": "10.11"},
+            ...
+        ]
+    }
+    """
+
     gc = gspread.oauth(
         credentials_filename=CREDENTIALS_FILE,
         authorized_user_filename=TOKEN_FILE,
     )
     sh = gc.open_by_key(SHEET_ID)
-    sheet = sh.worksheet(worksheet_name)
 
+    # *** choose worksheet based on PMS ***
+    ws_name = resolve_worksheet_name(data.get("pms_name"))
+    sheet = get_or_create_worksheet(sh, ws_name)
+
+    # ---- month label like "Jun '25" ----
     month_num = int(data["month"])
     year_num = int(data["year"])
     month_abbr = calendar.month_abbr[month_num]
     year_short = str(year_num)[-2:]
     target_month = f"{month_abbr} '{year_short}"
 
-    IA_COL = 2
+    IA_COL = 2           # column B
     IA_COL_IDX = IA_COL - 1
 
     all_rows = sheet.get_all_values()
     if not all_rows:
-        raise Exception(f"Sheet '{worksheet_name}' is empty!")
+        raise Exception("Sheet is empty!")
 
+    # ---- find Rs. Cr row (ONLY this row defines month columns) ----
     rscr_row_idx = None
     for i, row in enumerate(all_rows):
         if len(row) > 1 and row[1].strip().lower() == "rs. cr":
@@ -111,31 +204,42 @@ def update_pms_sheet(data: dict, worksheet_name: str):
             break
 
     if rscr_row_idx is None:
-        raise Exception(f"Could not find a row where column B is 'Rs. Cr' in sheet '{worksheet_name}'.")
+        raise Exception("Could not find a row where column B is 'Rs. Cr'.")
 
     rscr_row = all_rows[rscr_row_idx]
 
+    # ---- find / create month column based ONLY on Rs. Cr row ----
     if target_month in rscr_row:
-        month_col_index = rscr_row.index(target_month) + 1
+        # Month already exists in Rs. Cr row → use that column
+        month_col_index = rscr_row.index(target_month) + 1  # 1-based for gspread
     else:
+        # Find last non-empty cell in Rs. Cr row
         last_used_col = 0
         for idx, val in enumerate(rscr_row, start=1):
             if str(val).strip():
                 last_used_col = idx
+
+        # New month column is immediately after the last non-empty in Rs. Cr row
         if last_used_col > 0:
             month_col_index = last_used_col + 1
         else:
-            month_col_index = 3
+            # fallback: after column B ("Rs. Cr" is in B)
+            month_col_index = 3  # column C
 
         sheet.update_cell(rscr_row_idx + 1, month_col_index, target_month)
-        print(f"[SHEET:{worksheet_name}] Added month '{target_month}' at column {month_col_index}")
+        print(f"[SHEET] Added month '{target_month}' at column {month_col_index}")
 
-    print(f"[SHEET:{worksheet_name}] Using month = {target_month}, column index = {month_col_index}")
+    print(f"[SHEET] Using month = {target_month}, column index = {month_col_index}")
 
+    # ---- helpers ----
     def is_strategy_marker(text: str) -> bool:
+        """
+        TRUE only for real strategy header rows, NOT for things like
+        'Equity Strategy - Non Discretionary'.
+        """
         t = " ".join(text.lower().split())
         return (
-            t.startswith("equity aum total")
+            t.startswith("equity aum total")  # equity header
             or t == "debt"
             or t.startswith("debt ")
             or t == "hybrid"
@@ -145,9 +249,11 @@ def update_pms_sheet(data: dict, worksheet_name: str):
         )
 
     def is_service_marker(text: str) -> bool:
+        # AUM Total header rows ONLY
         t = " ".join(text.lower().split())
         return ("aum total" in t) and ("discretionary" in t)
 
+    # strategy name as used in sheet
     strategy_name = data["strategy"].strip().lower()
     if strategy_name == "multi":
         strategy_name = "multi-asset"
@@ -155,7 +261,8 @@ def update_pms_sheet(data: dict, worksheet_name: str):
     service_raw = data["service_type"].strip().lower()
     is_non_disc = service_raw.startswith("non")
 
-    print(f"\n[DEBUG:{worksheet_name}] Looking for STRATEGY row for '{strategy_name}'")
+    # ==== FIND STRATEGY ROW ONCE ====
+    print(f"\n[DEBUG] Looking for STRATEGY row for '{strategy_name}'")
     strat_idx = -1
     for i, row in enumerate(all_rows):
         if len(row) > 1:
@@ -168,11 +275,12 @@ def update_pms_sheet(data: dict, worksheet_name: str):
                 break
 
     if strat_idx == -1:
-        print(f"[SHEET:{worksheet_name}] Strategy '{strategy_name}' not found in column B. Skipping whole block.")
+        print(f"[SHEET] Strategy '{strategy_name}' not found in column B. Skipping whole block.")
         return
 
+    # ==== FIND SERVICE HEADER ROW (Dis / Non-Dis) ====
     print(
-        f"[DEBUG:{worksheet_name}] Looking for SERVICE header for '{data['service_type']}' "
+        f"[DEBUG] Looking for SERVICE header for '{data['service_type']}' "
         f"under strategy row {strat_idx+1}"
     )
     serv_idx = -1
@@ -185,11 +293,13 @@ def update_pms_sheet(data: dict, worksheet_name: str):
         cell = " ".join(raw_b.lower().split())
         print(f"   [DEBUG][SERV] row {i+1}: {repr(raw_b)}  ->  {cell}")
 
+        # stop when we hit next strategy section
         if is_strategy_marker(cell):
             print("   [DEBUG][SERV] --- hit next strategy marker; stop searching service header here ---")
             break
 
         if is_service_marker(cell):
+            # Now discriminate between Discretionary and Non-Discretionary
             if is_non_disc:
                 if "non" in cell:
                     serv_idx = i
@@ -207,11 +317,12 @@ def update_pms_sheet(data: dict, worksheet_name: str):
 
     if serv_idx == -1:
         print(
-            f"[SHEET:{worksheet_name}] Service type row for '{data['service_type']}' "
+            f"[SHEET] Service type row for '{data['service_type']}' "
             f"not found under strategy '{strategy_name}'. Skipping."
         )
         return
 
+    # ==== FIND BLOCK END (next service header or next strategy header) ====
     next_block = len(all_rows)
     for i in range(serv_idx + 1, len(all_rows)):
         row = all_rows[i]
@@ -223,21 +334,23 @@ def update_pms_sheet(data: dict, worksheet_name: str):
             next_block = i
             break
 
-    print(
-        f"[DEBUG:{worksheet_name}] IA rows for this block will be searched "
-        f"between rows {serv_idx+2} and {next_block} (1-based)"
-    )
+    print(f"[DEBUG] IA rows for this block will be searched between rows {serv_idx+2} and {next_block} (1-based)")
 
+    # ==== WRITE EACH IA INSIDE THIS BLOCK ====
     for res in data["results"]:
+        # Clean IA name from scraping:
         raw_ia_name = res["ia_name"].strip()
+        # Remove any leading dot like ". Alpha Focus Strategy"
         raw_ia_name = raw_ia_name.lstrip(". ").strip()
         ia_name = clean_ia_name(raw_ia_name, data.get("pms_name"))
-        aum_value = res["aum"]
+        aum_value = res["aum"]  # already without ₹
 
-        print(f"\n[DEBUG:{worksheet_name}][IA] Processing IA '{ia_name}' (raw: {res['ia_name']})")
+        print(f"\n[DEBUG][IA] Processing IA '{ia_name}' (raw: {res['ia_name']})")
 
+        # Refresh rows (in case we added rows earlier in this run)
         all_rows = sheet.get_all_values()
 
+        # 4) look for IA row inside [serv_idx+1, next_block)
         ia_idx = -1
         for i in range(serv_idx + 1, next_block):
             row = all_rows[i]
@@ -245,45 +358,46 @@ def update_pms_sheet(data: dict, worksheet_name: str):
                 cell_ia = row[IA_COL_IDX].strip()
                 cell_ia_norm = cell_ia.lstrip(". ").strip().lower()
                 print(
-                    f"   [DEBUG:{worksheet_name}][IA-MATCH] row {i+1}: sheet IA '{cell_ia}' "
+                    f"   [DEBUG][IA-MATCH] row {i+1}: sheet IA '{cell_ia}' "
                     f"-> norm '{cell_ia_norm}' vs target '{ia_name.lower()}'"
                 )
                 if cell_ia_norm == ia_name.lower():
                     ia_idx = i
-                    print(f"   [DEBUG:{worksheet_name}][IA-MATCH] >>> MATCH at row {i+1}")
+                    print(f"   [DEBUG][IA-MATCH] >>> MATCH at row {i+1}")
                     break
 
         if ia_idx != -1:
-            sheet.update_cell(ia_idx + 1, month_col_index, aum_value)
-            print(
-                f"[SHEET:{worksheet_name}] Updated IA '{ia_name}' "
-                f"at row {ia_idx+1}, col {month_col_index} = {aum_value}"
-            )
+            row_num = ia_idx + 1
+            sheet.update_cell(row_num, month_col_index, aum_value)
+            apply_ia_row_format(sheet, row_num, month_col_index)
+            print(f"[SHEET] Updated IA '{ia_name}' at row {row_num}, col {month_col_index} = {aum_value}")
         else:
             newrow_len = max(len(rscr_row), month_col_index, IA_COL)
             newrow = [''] * newrow_len
             newrow[IA_COL_IDX] = ia_name
             newrow[month_col_index - 1] = aum_value
 
-            insert_at = next_block + 1
+            insert_at = next_block + 1  # 1-based
             sheet.insert_row(newrow, insert_at)
-            print(
-                f"[SHEET:{worksheet_name}] Inserted IA '{ia_name}' "
-                f"at row {insert_at}, col {month_col_index} = {aum_value}"
-            )
+            apply_ia_row_format(sheet, insert_at, month_col_index)
+            print(f"[SHEET] Inserted IA '{ia_name}' at row {insert_at}, col {month_col_index} = {aum_value}")
+            # block end shifts down by 1
             next_block += 1
 
 
 # =========================
 # TOTALS RECOMPUTE
 # =========================
-def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name: str):
+def recompute_totals_for_month(month_value: str, year_value: str, pms_name: Optional[str]):
+    """Recompute Dis/Non-Dis and strategy + Total PMS AUM for one month, per PMS sheet."""
     gc = gspread.oauth(
         credentials_filename=CREDENTIALS_FILE,
         authorized_user_filename=TOKEN_FILE,
     )
     sh = gc.open_by_key(SHEET_ID)
-    sheet = sh.worksheet(worksheet_name)
+
+    ws_name = resolve_worksheet_name(pms_name)
+    sheet = get_or_create_worksheet(sh, ws_name)
 
     month_num = int(month_value)
     year_num = int(year_value)
@@ -293,9 +407,10 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
 
     all_rows = sheet.get_all_values()
     if not all_rows:
-        print(f"[TOTALS:{worksheet_name}] Sheet empty.")
+        print("[TOTALS] Sheet empty.")
         return
 
+    # ---- find Rs. Cr row & month column ----
     rscr_row_idx = None
     for i, row in enumerate(all_rows):
         if len(row) > 1 and row[1].strip().lower() == "rs. cr":
@@ -303,18 +418,21 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
             break
 
     if rscr_row_idx is None:
-        print(f"[TOTALS:{worksheet_name}] No 'Rs. Cr' row.")
+        print("[TOTALS] No 'Rs. Cr' row.")
         return
 
     rscr_row = all_rows[rscr_row_idx]
     if target_month not in rscr_row:
-        print(f"[TOTALS:{worksheet_name}] Month '{target_month}' not found.")
+        print(f"[TOTALS] Month '{target_month}' not found.")
         return
 
-    month_col_index = rscr_row.index(target_month) + 1
-    print(f"[TOTALS:{worksheet_name}] Recomputing totals for {target_month} (col {month_col_index})")
+    month_col_index = rscr_row.index(target_month) + 1  # 1-based
+    print(f"[TOTALS] Recomputing totals for {target_month} (col {month_col_index}) in sheet '{ws_name}'")
 
     def is_strategy_marker(text: str) -> bool:
+        """
+        Same logic as above: match only real strategy headers.
+        """
         t = " ".join(text.lower().split())
         return (
             t.startswith("equity aum total")
@@ -328,11 +446,13 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
 
     def is_service_marker(text: str) -> bool:
         t = " ".join(text.lower().split())
+        # only header rows: "Discretionary AUM Total", "Non-Discretionary AUM Total"
         return ("aum total" in t) and ("discretionary" in t)
 
     strategy_totals = {}
     current_strategy_row = None
 
+    # ---- scan full sheet ----
     for i, row in enumerate(all_rows):
         if len(row) <= 1:
             continue
@@ -340,17 +460,20 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
         col_b = row[1]
         col_b_norm = " ".join(col_b.lower().split())
 
+        # strategy header row
         if is_strategy_marker(col_b_norm):
             current_strategy_row = i
             strategy_totals.setdefault(i, 0.0)
             continue
 
+        # service total row
         if is_service_marker(col_b_norm):
             if current_strategy_row is None:
                 continue
 
             service_row_idx = i
 
+            # block of IA rows under this service
             block_end = len(all_rows)
             for j in range(service_row_idx + 1, len(all_rows)):
                 if len(all_rows[j]) <= 1:
@@ -371,17 +494,20 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
                 try:
                     subtotal += float(val_str)
                 except ValueError:
+                    # e.g. "NA"
                     continue
 
             sheet.update_cell(service_row_idx + 1, month_col_index, f"{subtotal:.2f}")
-            print(f"[TOTALS:{worksheet_name}] Service row '{col_b}' row {service_row_idx+1}: {subtotal:.2f}")
+            print(f"[TOTALS] Service row '{col_b}' row {service_row_idx+1}: {subtotal:.2f}")
 
             strategy_totals[current_strategy_row] = strategy_totals.get(current_strategy_row, 0.0) + subtotal
 
+    # ---- write strategy totals (Equity AUM Total, Debt, Hybrid, Multi-Asset) ----
     for strat_row_idx, tot in strategy_totals.items():
         sheet.update_cell(strat_row_idx + 1, month_col_index, f"{tot:.2f}")
-        print(f"[TOTALS:{worksheet_name}] Strategy total row {strat_row_idx+1}: {tot:.2f}")
+        print(f"[TOTALS] Strategy total row {strat_row_idx+1}: {tot:.2f}")
 
+    # ---- Total PMS AUM row ----
     total_row_idx = None
     for i, row in enumerate(all_rows):
         if len(row) > 1 and row[1].strip().lower() in ("total pms aum", "total aum", "total"):
@@ -391,21 +517,27 @@ def recompute_totals_for_month(month_value: str, year_value: str, worksheet_name
     if total_row_idx is not None and strategy_totals:
         grand = sum(strategy_totals.values())
         sheet.update_cell(total_row_idx + 1, month_col_index, f"{grand:.2f}")
-        print(f"[TOTALS:{worksheet_name}] Total PMS AUM row {total_row_idx+1}: {grand:.2f}")
+        print(f"[TOTALS] Total PMS AUM row {total_row_idx+1}: {grand:.2f}")
     else:
-        print(f"[TOTALS:{worksheet_name}] No 'Total PMS AUM' row found, or no strategy totals.")
+        print("[TOTALS] No 'Total PMS AUM' row found, or no strategy totals.")
 
 
 # =========================
 # SCRAPE ONE COMBINATION
 # =========================
 def scrape_one_combo(driver, strategy_value, service_code, month_value, year_value, pms_name):
+    """
+    strategy_value: 'equity' | 'debt' | 'hybrid' | 'multi'
+    service_code: 'D' or 'N'
+    returns: (results, service_label)
+    """
     service_label = 'discretionary' if service_code.upper() == 'D' else 'non discretionary'
 
     driver.get("https://www.apmiindia.org/apmi/welcomeiaperformance.htm?action=PMSmenu")
     wait = WebDriverWait(driver, 20)
     time.sleep(1.0)
 
+    # 1. Strategy
     valid_strategies = {"equity", "debt", "hybrid", "multi"}
     strat_id = strategy_value if strategy_value in valid_strategies else "equity"
     strat_radio = driver.find_element(By.ID, strat_id)
@@ -413,11 +545,13 @@ def scrape_one_combo(driver, strategy_value, service_code, month_value, year_val
     print(f"[SCRAPE] Strategy: {strat_id}, Service: {service_label}, Month-Year: {month_value}-{year_value}")
     time.sleep(0.2)
 
+    # 2. Service D/N
     radio_id = "servicetypeN" if service_code.upper() == "N" else "servicetypeD"
     service_radio = driver.find_element(By.ID, radio_id)
     driver.execute_script("arguments[0].click();", service_radio)
     time.sleep(0.2)
 
+    # 3. PMS (optional)
     if pms_name:
         select_elem = wait.until(EC.element_to_be_clickable((By.ID, "pmsProvideName")))
         try:
@@ -430,19 +564,23 @@ def scrape_one_combo(driver, strategy_value, service_code, month_value, year_val
     else:
         print("[SCRAPE] PMS Provider: ALL")
 
+    # 4. Year then Month (IMPORTANT: year first so month isn't reset)
     Select(driver.find_element(By.ID, "fromYears")).select_by_visible_text(year_value)
     time.sleep(0.4)
     Select(driver.find_element(By.ID, "fromMonth")).select_by_visible_text(month_value.zfill(2))
     time.sleep(0.6)
 
+    # DEBUG: confirm dropdown values
     selected_month = Select(driver.find_element(By.ID, "fromMonth")).first_selected_option.text.strip()
     selected_year = Select(driver.find_element(By.ID, "fromYears")).first_selected_option.text.strip()
     print(f"[SCRAPE] Dropdown now set to: {selected_month}-{selected_year}")
 
+    # 5. Submit
     submit_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Submit')]")))
     submit_btn.click()
     time.sleep(1.0)
 
+    # 6. Scrape pages
     ia_results = []
     page_num = 1
     while True:
@@ -457,6 +595,7 @@ def scrape_one_combo(driver, strategy_value, service_code, month_value, year_val
             aum_raw = tds[2].text.strip()
             aum = aum_raw.replace("₹", "").strip()
 
+            # strip leading dot then clean by PMS name
             ia_name_raw = ia_name_raw.lstrip(". ").strip()
             ia_name = clean_ia_name(ia_name_raw, pms_name)
 
@@ -482,6 +621,7 @@ def scrape_one_combo(driver, strategy_value, service_code, month_value, year_val
             print(f"[SCRAPE] Pagination finished or error: {e}")
             break
 
+    # --- DEBUG: print scraped IA values for this combo ---
     print(f"[SCRAPE] Finished: {len(ia_results)} IA records.")
     print("--------------- SCRAPED VALUES ---------------")
     print(f"Strategy     : {strategy_value}")
@@ -519,15 +659,14 @@ if __name__ == "__main__":
         print_usage()
         sys.exit(1)
 
+    # PMS name or ALL
     raw_pms = args[0].strip()
     if raw_pms == "-" or raw_pms.lower() == "all":
         pms_name = None
     else:
         pms_name = raw_pms
 
-    worksheet_name = sheet_name_from_pms(pms_name)
-    print(f"[MAIN] Using worksheet/tab: '{worksheet_name}'")
-
+    # month-year pairs
     month_year_pairs = []
     for token in args[1:]:
         token = token.strip()
@@ -546,9 +685,11 @@ if __name__ == "__main__":
             sys.exit(1)
         month_year_pairs.append((m, y))
 
+    # strategies + service codes
     strategies = ["equity", "debt", "hybrid", "multi"]
     service_codes = ["D", "N"]
 
+    # selenium driver
     options = webdriver.ChromeOptions()
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--headless=new")
@@ -559,10 +700,7 @@ if __name__ == "__main__":
         for (month_value, year_value) in month_year_pairs:
             for strategy_value in strategies:
                 for service_code in service_codes:
-                    print(
-                        f"\n=== RUN: {strategy_value.upper()} | {service_code} | "
-                        f"{month_value}-{year_value} | Sheet: {worksheet_name} ==="
-                    )
+                    print(f"\n=== RUN: {strategy_value.upper()} | {service_code} | {month_value}-{year_value} ===")
 
                     ia_results, service_label = scrape_one_combo(
                         driver=driver,
@@ -586,10 +724,10 @@ if __name__ == "__main__":
                         "results": ia_results,
                     }
 
-                    update_pms_sheet(data_for_sheet, worksheet_name)
+                    update_pms_sheet(data_for_sheet)
 
-            recompute_totals_for_month(month_value, year_value, worksheet_name)
+            # after all strategies + D/N for this month, recompute totals (per PMS sheet)
+            recompute_totals_for_month(month_value, year_value, pms_name)
     finally:
         driver.quit()
         time.sleep(1)
-
