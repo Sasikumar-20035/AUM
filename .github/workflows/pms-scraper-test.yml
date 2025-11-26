@@ -24,16 +24,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Create credentials.json
+      - name: Write OAuth credentials (credentials.json + token.json)
         env:
-          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-        run: echo "$GCP_CREDENTIALS_JSON" > credentials.json
+          CREDS: ${{ secrets.GSPREAD_CREDENTIALS_JSON }}
+          TOKEN: ${{ secrets.GSPREAD_TOKEN_JSON }}
+        run: |
+          echo "$CREDS" > credentials.json
+          echo "$TOKEN" > token.json
 
-      - name: Run scraper for OCT 2025 (3 PMS)
+      - name: Run scraper for OCT 2025 (Capitalmind only)
         run: |
           echo "Running test for: 10-2025"
-
           python Data1.py "Capitalmind Financial Services Private Limited" "10-2025"
-          
-
           echo "Test completed."
+
