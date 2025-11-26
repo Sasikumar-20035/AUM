@@ -1,10 +1,12 @@
-name: PMS Scraper Test (One-Time)
+name: PMS Scraper Scheduler
 
 on:
-  workflow_dispatch:   # run manually
+  schedule:
+    - cron: "0 3 1 * *"     # Every month, day 1, 03:00 UTC
+  workflow_dispatch:        # You can also run it manually
 
 jobs:
-  run-test:
+  run-scraper:
     runs-on: ubuntu-latest
 
     steps:
@@ -32,9 +34,64 @@ jobs:
           echo "$CREDS" > credentials.json
           echo "$TOKEN" > token.json
 
-      - name: Run scraper for OCT 2025 (Capitalmind only)
+      - name: Determine previous month
+        id: prev
         run: |
-          echo "Running test for: 10-2025"
-          python Data1.py "Capitalmind Financial Services Private Limited" "10-2025"
-          echo "Test completed."
+          PREV=$(date -u -d "last month" +'%m-%Y')
+          MONTH=$(echo $PREV | cut -d'-' -f1)
+          YEAR=$(echo $PREV | cut -d'-' -f2)
+          echo "prev_month=$MONTH" >> $GITHUB_OUTPUT
+          echo "prev_year=$YEAR"  >> $GITHUB_OUTPUT
+          echo "prev_full=$PREV" >> $GITHUB_OUTPUT
+          echo "Previous month = $PREV"
+
+      - name: Decide which PMS to run
+        id: gate
+        run: |
+          MONTH="${{ steps.prev.outputs.prev_month }}"
+
+          RUN_QUARTER="no"
+          RUN_DEZERV="no"
+
+          # Quarter months for Capitalmind + Wealth Managers
+          if [[ "$MONTH" =~ ^(01|04|07|10)$ ]]; then
+            RUN_QUARTER="yes"
+          fi
+
+          # Different month set for Dezerv (adjust if needed)
+          if [[ "$MONTH" =~ ^(03|06|09|12)$ ]]; then
+            RUN_DEZERV="yes"
+          fi
+
+          echo "run_quarter=$RUN_QUARTER" >> $GITHUB_OUTPUT
+          echo "run_dezerv=$RUN_DEZERV"   >> $GITHUB_OUTPUT
+
+          echo "Quarter PMS run? $RUN_QUARTER"
+          echo "Dezerv run?      $RUN_DEZERV"
+
+      - name: Skip if nothing to run
+        if: steps.gate.outputs.run_quarter == 'no' && steps.gate.outputs.run_dezerv == 'no'
+        run: |
+          echo "Skipping. Previous month (${{ steps.prev.outputs.prev_full }}) is not configured for any PMS."
+
+      - name: Run PMS scraper based on rules
+        if: steps.gate.outputs.run_quarter == 'yes' || steps.gate.outputs.run_dezerv == 'yes'
+        run: |
+          MONTHYEAR="${{ steps.prev.outputs.prev_full }}"
+          echo "Running scraper for $MONTHYEAR"
+
+          # Quarter PMS (01,04,07,10): Capitalmind + Wealth Managers
+          if [ "${{ steps.gate.outputs.run_quarter }}" = "yes" ]; then
+            echo "-> Running quarter PMS: Capitalmind + Wealth Managers"
+            python Data1.py "Capitalmind Financial Services Private Limited" "$MONTHYEAR"
+            python Data1.py "Wealth Managers (India) Pvt. Ltd." "$MONTHYEAR"
+          fi
+
+          # Dezerv on its own month set (02,05,08,11)
+          if [ "${{ steps.gate.outputs.run_dezerv }}" = "yes" ]; then
+            echo "-> Running Dezerv PMS"
+            python Data1.py "Dezerv Investments Private Limited" "$MONTHYEAR"
+          fi
+
+          echo "All configured PMS runs completed for $MONTHYEAR."
 
