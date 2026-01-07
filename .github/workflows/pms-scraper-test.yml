@@ -2,7 +2,7 @@ name: PMS Scraper Scheduler
 
 on:
   schedule:
-    - cron: "0 3 1 * *"     # Every month, day 1, 03:00 UTC
+    - cron: "0 3 15 * *"     # Every month, day 1, 03:00 UTC
   workflow_dispatch:        # You can also run it manually
 
 jobs:
